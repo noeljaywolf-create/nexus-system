@@ -8,3 +8,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: NEXUS_ALLOWED_HOSTS
+        value: nexus-system-0cd6.onrender.com
+      - key: NEXUS_SECURE_COOKIE
+        value: "1"
