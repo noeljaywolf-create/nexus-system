@@ -1,1 +1,1 @@
-web: python launcher.py --port 
+web: python launcher.py --port  --no-browser
