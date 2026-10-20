@@ -1,0 +1,31 @@
+{
+  "contract_version": 1,
+  "packages": [
+    {
+      "id": "construction-costing",
+      "name": "Construction · Project costing",
+      "description": "Record dated labor, materials, equipment and subcontractor costs against authorized projects.",
+      "record_name": "Project cost",
+      "fields": [
+        {"key": "description", "label": "Cost description", "type": "text", "required": true},
+        {"key": "category", "label": "Cost category", "type": "enum", "options": ["materials", "labor", "equipment", "subcontractor", "other"]},
+        {"key": "amount", "label": "Cost amount", "type": "money"},
+        {"key": "date", "label": "Cost date", "type": "date"},
+        {"key": "notes", "label": "Notes", "type": "text", "required": false}
+      ]
+    },
+    {
+      "id": "professional-timesheets",
+      "name": "Professional services · Timesheets",
+      "description": "Log time, activity and hourly rates against authorized client projects.",
+      "record_name": "Time entry",
+      "fields": [
+        {"key": "description", "label": "Work performed", "type": "text", "required": true},
+        {"key": "minutes", "label": "Minutes worked", "type": "integer"},
+        {"key": "hourly_rate", "label": "Hourly rate", "type": "money"},
+        {"key": "date", "label": "Work date", "type": "date"},
+        {"key": "billing", "label": "Billing classification", "type": "enum", "options": ["billable", "non-billable"]}
+      ]
+    }
+  ]
+}
