@@ -21,24 +21,63 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit, quote
 import threading
+import subprocess
+import tempfile
 import workflows
 import ai_gateway
 from document_store import DocumentStore,PREVIEWABLE
 from exports import make_csv
+
+import db as nexus_db
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get('NEXUS_DB', str(ROOT / 'data' / 'nexus.sqlite3')))
 SESSION_SECONDS = 12 * 60 * 60
 MAX_BODY = 30 * 1024 * 1024
 ROLES = {'admin', 'manager', 'finance', 'member', 'viewer'}
+RATE_LIMIT_GET = int(os.environ.get('NEXUS_RATE_GET', '1200'))
+RATE_LIMIT_MUTATE = int(os.environ.get('NEXUS_RATE_MUTATE', '600'))
+IDEMPOTENCY_TTL_HOURS = int(os.environ.get('NEXUS_IDEMPOTENCY_TTL_HOURS', '72'))
 PACKAGES = json.loads((ROOT / 'packages.json').read_text('utf-8'))
 RECORD_TABLES={'product':'products','customer':'customers','supplier':'suppliers','invoice':'invoices','requisition':'requisitions','task':'tasks','asset':'assets','contract':'contracts','document':'documents','meeting':'meetings','purchase_order':'purchase_orders'}
+REQUEST_ID_RE = re.compile(r'^[A-Za-z0-9._:-]{8,128}$')
+_RATE_LOCK = threading.Lock()
+_RATE_BUCKETS = {}
+
+def rate_allow(key, limit, window):
+    now_ts = int(time.time())
+    with _RATE_LOCK:
+        bucket = _RATE_BUCKETS.get(key)
+        if not bucket or now_ts - bucket['start'] >= window:
+            bucket = {'start': now_ts, 'count': 0}
+        bucket['count'] += 1
+        _RATE_BUCKETS[key] = bucket
+        if len(_RATE_BUCKETS) > 5000:
+            cutoff = now_ts - window
+            for stale_key in [k for k, v in _RATE_BUCKETS.items() if v['start'] < cutoff]:
+                _RATE_BUCKETS.pop(stale_key, None)
+        return bucket['count'] <= limit
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec='microseconds')
 
 def uid():
     return uuid.uuid4().hex
+
+def scan_upload(content, filename='upload.bin'):
+    cmd=os.environ.get('NEXUS_UPLOAD_SCAN_CMD','').strip()
+    if not cmd: return
+    suffix=Path(filename).suffix
+    fd,path=tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd,'wb') as f: f.write(content)
+        rendered=cmd.replace('{file}', path)
+        proc=subprocess.run(rendered, shell=True, capture_output=True, text=True, timeout=int(os.environ.get('NEXUS_UPLOAD_SCAN_TIMEOUT','20')))
+        if proc.returncode!=0:
+            raise APIError(400,'Upload blocked by security scan')
+    finally:
+        try: os.remove(path)
+        except Exception: pass
 
 def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
@@ -56,25 +95,48 @@ def password_valid(password, stored):
     except (ValueError, TypeError):
         return False
 
-class Database(sqlite3.Connection):
-    def __exit__(self, *args):
-        try:
-            return super().__exit__(*args)
-        finally:
-            self.close()
+Database = nexus_db.SQLiteConnection
 
-def connect_db():
-    db = sqlite3.connect(DB_PATH, timeout=15, factory=Database)
-    db.row_factory = sqlite3.Row
-    db.execute('PRAGMA foreign_keys=ON')
-    db.execute('PRAGMA busy_timeout=15000')
-    return db
 
-def initialize():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with connect_db() as db:
-        db.execute('PRAGMA journal_mode=WAL')
-        db.executescript((ROOT / 'schema.sql').read_text('utf-8'))
+def _sync_db_path():
+    # Tests and callers may override server.DB_PATH; keep sqlite default in sync.
+    nexus_db.DB_PATH = Path(DB_PATH)
+
+
+def db_backend():
+    return nexus_db.backend_name()
+
+
+def db_is_postgres():
+    return nexus_db.is_postgres()
+
+
+def connect_db(path=None, timeout=15):
+    _sync_db_path()
+    if nexus_db.is_postgres():
+        return nexus_db.connect_postgres()
+    return nexus_db.connect_sqlite(Path(path) if path is not None else Path(DB_PATH), timeout=timeout)
+
+
+def prune_idempotency_keys(db):
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, IDEMPOTENCY_TTL_HOURS))).isoformat(timespec='microseconds')
+        db.execute('DELETE FROM idempotency_keys WHERE created_at < ?', (cutoff,))
+        db.commit()
+    except Exception:
+        try: db.rollback()
+        except Exception: pass
+
+def initialize(path=None):
+    _sync_db_path()
+    if nexus_db.is_postgres():
+        nexus_db.init_postgres()
+        with nexus_db.connect_postgres() as db:
+            prune_idempotency_keys(db)
+        return
+    nexus_db.init_sqlite(Path(path) if path is not None else Path(DB_PATH))
+    with nexus_db.connect_sqlite(Path(path) if path is not None else Path(DB_PATH)) as db:
+        prune_idempotency_keys(db)
 
 class APIError(Exception):
     def __init__(self, status, message):
@@ -129,6 +191,12 @@ class Service:
     def __init__(self, db, identity):
         self.db, self.me = db, identity
         self.org, self.user, self.role = identity['org_id'], identity['user_id'], identity['role']
+        self.request_id = identity.get('request_id', '')
+
+    def lock(self, table, record_id):
+        if getattr(self.db, 'is_postgres', False):
+            # table is always an application constant.
+            self.db.execute(f'SELECT id FROM {table} WHERE org_id=? AND id=? FOR UPDATE', (self.org, record_id))
 
     def document_store(self):
         return DocumentStore(self,require,text,APIError)
@@ -148,10 +216,10 @@ class Service:
     def write(self):
         self.allow('admin', 'manager', 'finance', 'member')
 
-    def member(self, user_id):
+    def member(self, user_id, allow_inactive=False):
         require(isinstance(user_id,str) and re.fullmatch(r'[a-f0-9]{32}',user_id),'Select a valid workspace member')
-        row = self.db.execute('SELECT * FROM memberships WHERE org_id=? AND user_id=? AND active=1', (self.org, user_id)).fetchone()
-        require(row is not None, 'Select an active workspace member')
+        row = self.db.execute('SELECT * FROM memberships WHERE org_id=? AND user_id=?' + ('' if allow_inactive else ' AND active=1'), (self.org, user_id)).fetchone()
+        require(row is not None, 'Select a workspace member' if allow_inactive else 'Select an active workspace member')
         return dict(row)
 
     def project(self, project_id):
@@ -229,7 +297,10 @@ class Service:
             return False
 
     def audit(self, action, kind, record_id, details=None):
-        self.db.execute('INSERT INTO audit_log(id,org_id,actor_id,action,record_type,record_id,details,created_at) VALUES(?,?,?,?,?,?,?,?)', (uid(), self.org, self.user, action, kind, record_id, json.dumps(details or {}), now()))
+        payload = dict(details or {})
+        if self.request_id and 'request_id' not in payload:
+            payload['request_id'] = self.request_id
+        self.db.execute('INSERT INTO audit_log(id,org_id,actor_id,action,record_type,record_id,details,created_at) VALUES(?,?,?,?,?,?,?,?)', (uid(), self.org, self.user, action, kind, record_id, json.dumps(payload, ensure_ascii=False), now()))
 
     def notify(self, user_id, message, kind, record_id):
         self.db.execute('INSERT INTO notifications VALUES(?,?,?,?,?,?,?,?)', (uid(), self.org, user_id, message, kind, record_id, None, now()))
@@ -270,7 +341,7 @@ class Service:
         if path == '/api/assistant/status':
             return ai_gateway.status()
         if path == '/api/people':
-            return self.rows('SELECT u.id,u.name,u.email,m.role,m.department,MAX(s.last_seen) last_seen FROM memberships m JOIN users u ON u.id=m.user_id LEFT JOIN sessions s ON s.user_id=u.id AND s.org_id=m.org_id WHERE m.org_id=? AND m.active=1 GROUP BY u.id ORDER BY u.name', (self.org,))
+            return self.rows('SELECT u.id,u.name,u.email,m.role,m.department,m.active,MAX(s.last_seen) last_seen FROM memberships m JOIN users u ON u.id=m.user_id LEFT JOIN sessions s ON s.user_id=u.id AND s.org_id=m.org_id WHERE m.org_id=? GROUP BY u.id,u.name,u.email,m.role,m.department,m.active ORDER BY m.active DESC, u.name', (self.org,))
         if path == '/api/projects':
             return self.projects()
         if len(parts) == 4 and parts[1] == 'projects' and parts[3] == 'members':
@@ -284,7 +355,10 @@ class Service:
                     self.conversation(c['id'])
                     if c['context_kind']:
                         c['context_project_id']=self.business_record(c['context_kind'],c['context_id']).get('project_id')
-                    c['unread'] = self.db.execute("SELECT COUNT(*) FROM messages WHERE conversation_id=? AND author_id!=? AND deleted_at IS NULL AND created_at>COALESCE((SELECT last_read FROM conversation_members WHERE conversation_id=? AND user_id=?),'')", (c['id'],self.user,c['id'],self.user)).fetchone()[0]
+                    if getattr(self.db,'is_postgres',False):
+                        c['unread'] = self.db.execute("SELECT COUNT(*) FROM messages WHERE conversation_id=? AND author_id!=? AND deleted_at IS NULL AND created_at > COALESCE(NULLIF((SELECT last_read FROM conversation_members WHERE conversation_id=? AND user_id=?),'')::timestamptz, '-infinity'::timestamptz)", (c['id'],self.user,c['id'],self.user)).fetchone()[0]
+                    else:
+                        c['unread'] = self.db.execute("SELECT COUNT(*) FROM messages WHERE conversation_id=? AND author_id!=? AND deleted_at IS NULL AND created_at>COALESCE((SELECT last_read FROM conversation_members WHERE conversation_id=? AND user_id=?),'')", (c['id'],self.user,c['id'],self.user)).fetchone()[0]
                     result.append(c)
                 except APIError:
                     pass
@@ -297,14 +371,20 @@ class Service:
             around=query.get('around',[''])[0]
             if around:
                 target=self.message(around);require(target['conversation_id']==c['id'],'Source message belongs to another conversation',400)
-                rows=self.rows('SELECT m.*,u.name author_name FROM messages m JOIN users u ON u.id=m.author_id WHERE m.conversation_id=? ORDER BY ABS(julianday(m.created_at)-julianday(?)) LIMIT 300',(c['id'],target['created_at']))
+                if getattr(self.db,'is_postgres',False):
+                    rows=self.rows('SELECT m.*,u.name author_name FROM messages m JOIN users u ON u.id=m.author_id WHERE m.conversation_id=? ORDER BY ABS(EXTRACT(EPOCH FROM m.created_at - ?::timestamptz)) LIMIT 300',(c['id'],target['created_at']))
+                else:
+                    rows=self.rows('SELECT m.*,u.name author_name FROM messages m JOIN users u ON u.id=m.author_id WHERE m.conversation_id=? ORDER BY ABS(julianday(m.created_at)-julianday(?)) LIMIT 300',(c['id'],target['created_at']))
                 rows.sort(key=lambda r:r['created_at'],reverse=True)
             else:
                 rows = self.rows("SELECT m.*,u.name author_name FROM messages m JOIN users u ON u.id=m.author_id WHERE m.conversation_id=? AND (?='' OR m.body LIKE ? ESCAPE '\\') ORDER BY m.created_at DESC LIMIT 300", (c['id'],q,'%'+q.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'))
             for row in rows:
-                row['reactions'] = self.rows('SELECT emoji,COUNT(*) count,MAX(user_id=?) mine FROM reactions WHERE message_id=? GROUP BY emoji', (self.user,row['id']))
+                row['reactions'] = self.rows('SELECT emoji,COUNT(*) count,MAX(CASE WHEN user_id=? THEN 1 ELSE 0 END) mine FROM reactions WHERE message_id=? GROUP BY emoji', (self.user,row['id']))
                 row['attachments'] = self.rows('SELECT id,filename,mime,length(content) size FROM attachments WHERE message_id=?', (row['id'],)) if not row['deleted_at'] else []
-                row['read_by'] = self.rows('SELECT u.name FROM conversation_members cm JOIN users u ON cm.user_id=u.id WHERE cm.conversation_id=? AND cm.last_read>=? AND cm.user_id!=?', (c['id'],row['created_at'],row['author_id']))
+                if getattr(self.db,'is_postgres',False):
+                    row['read_by'] = self.rows("SELECT u.name FROM conversation_members cm JOIN users u ON cm.user_id=u.id WHERE cm.conversation_id=? AND cm.last_read<>'' AND cm.last_read::timestamptz >= ?::timestamptz AND cm.user_id!=?", (c['id'],row['created_at'],row['author_id']))
+                else:
+                    row['read_by'] = self.rows('SELECT u.name FROM conversation_members cm JOIN users u ON cm.user_id=u.id WHERE cm.conversation_id=? AND cm.last_read>=? AND cm.user_id!=?', (c['id'],row['created_at'],row['author_id']))
             return list(reversed(rows))
         if path == '/api/tasks':
             return [t for t in self.rows('SELECT t.*,u.name assignee_name,p.name project_name FROM tasks t JOIN users u ON u.id=t.assignee_id LEFT JOIN projects p ON p.id=t.project_id WHERE t.org_id=? ORDER BY t.created_at DESC', (self.org,)) if self.can_record(t)]
@@ -386,7 +466,10 @@ class Service:
                 current=datetime.now(timezone.utc)
                 for offset in range(5,-1,-1):
                     year,month=divmod(current.year*12+current.month-1-offset,12);period=f'{year:04d}-{month+1:02d}'
-                    amount=self.db.execute("SELECT COALESCE(SUM(l.credit-l.debit),0) FROM ledger_lines l JOIN ledger_entries e ON e.id=l.entry_id WHERE e.org_id=? AND l.account='4000 Revenue' AND substr(e.created_at,1,7)=?",(self.org,period)).fetchone()[0]
+                    if getattr(self.db,'is_postgres',False):
+                        amount=self.db.execute("SELECT COALESCE(SUM(l.credit-l.debit),0) FROM ledger_lines l JOIN ledger_entries e ON e.id=l.entry_id WHERE e.org_id=? AND l.account='4000 Revenue' AND to_char(e.created_at AT TIME ZONE 'UTC','YYYY-MM')=?",(self.org,period)).fetchone()[0]
+                    else:
+                        amount=self.db.execute("SELECT COALESCE(SUM(l.credit-l.debit),0) FROM ledger_lines l JOIN ledger_entries e ON e.id=l.entry_id WHERE e.org_id=? AND l.account='4000 Revenue' AND substr(e.created_at,1,7)=?",(self.org,period)).fetchone()[0]
                     trend.append({'period':period,'label':datetime(year,month+1,1).strftime('%b'),'amount':amount})
                 receivables=self.db.execute("SELECT COALESCE(SUM(l.debit-l.credit),0) FROM ledger_lines l JOIN ledger_entries e ON e.id=l.entry_id WHERE e.org_id=? AND l.account='1100 Accounts receivable'",(self.org,)).fetchone()[0]
                 cash=self.db.execute("SELECT COALESCE(SUM(l.debit-l.credit),0) FROM ledger_lines l JOIN ledger_entries e ON e.id=l.entry_id WHERE e.org_id=? AND l.account='1000 Cash'",(self.org,)).fetchone()[0]
@@ -466,7 +549,7 @@ class Service:
             through_id=data.get('through_id')
             if through_id:
                 message=self.message(through_id);require(message['conversation_id']==c['id'],'Read marker belongs to another conversation');timestamp=message['created_at']
-            self.db.execute('INSERT INTO conversation_members(org_id,conversation_id,user_id,last_read) VALUES(?,?,?,?) ON CONFLICT(conversation_id,user_id) DO UPDATE SET last_read=MAX(conversation_members.last_read,excluded.last_read)',(self.org,c['id'],self.user,timestamp))
+            self.db.execute('INSERT INTO conversation_members(org_id,conversation_id,user_id,last_read) VALUES(?,?,?,?) ON CONFLICT(conversation_id,user_id) DO UPDATE SET last_read=CASE WHEN conversation_members.last_read>=excluded.last_read THEN conversation_members.last_read ELSE excluded.last_read END',(self.org,c['id'],self.user,timestamp))
             return {'ok':True}
         if len(parts)==4 and parts[1]=='messages' and parts[3]=='react':
             self.write(); m=self.message(parts[2]); require(not m['deleted_at'],'Message removed')
@@ -483,6 +566,7 @@ class Service:
             try: content=base64.b64decode(text(data,'content',limit=MAX_BODY),validate=True)
             except (binascii.Error,ValueError): raise APIError(400,'Invalid attachment encoding')
             require(0<len(content)<=5*1024*1024,'Files must be between 1 byte and 5 MB')
+            scan_upload(content, filename)
             self.db.execute('INSERT INTO attachments VALUES(?,?,?,?,?,?,?,?,?)',(record_id,self.org,m['conversation_id'],m['id'],filename,mime,content,self.user,timestamp))
             self.audit('upload','attachment',record_id,{'filename':filename,'bytes':len(content)})
             return {'id':record_id,'filename':filename}
@@ -516,8 +600,10 @@ class Service:
         if len(parts)==4 and parts[1]=='products' and parts[3]=='stock':
             self.allow('admin','manager'); p=self.one('products',parts[2])
             quantity=integer(data,'quantity',-1_000_000,1_000_000)
-            require(quantity!=0,'Quantity must not be zero'); require(p['stock']+quantity>=0,'Insufficient stock')
-            self.db.execute('UPDATE products SET stock=stock+? WHERE id=?',(quantity,p['id']))
+            require(quantity!=0,'Quantity must not be zero')
+            self.lock('products', p['id'])
+            changed=self.db.execute('UPDATE products SET stock=stock+? WHERE org_id=? AND id=? AND stock+? >= 0',(quantity,self.org,p['id'],quantity)).rowcount
+            require(changed==1,'Insufficient stock',400)
             reason=text(data,'reason',limit=500)
             self.db.execute('INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?)',(record_id,self.org,p['id'],quantity,reason,self.user,timestamp))
             self.audit('adjust_stock','product',p['id'],{'quantity':quantity,'reason':reason}); return self.one('products',p['id'])
@@ -530,21 +616,28 @@ class Service:
             if action=='submit':
                 require(r['created_by']==self.user,'Only the requester may submit',403)
                 require(r['status'] in ('draft','rejected'),'Only draft or rejected requests can be submitted',409)
-                self.db.execute("UPDATE requisitions SET status='submitted',submitted_at=? WHERE id=?",(timestamp,r['id']))
+                self.lock('requisitions', r['id'])
+                changed=self.db.execute("UPDATE requisitions SET status='submitted',submitted_at=? WHERE org_id=? AND id=? AND status=?",(timestamp,self.org,r['id'],r['status'])).rowcount
+                require(changed==1,'This request changed before it could be submitted. Refresh and try again.',409)
                 self.audit('submit','requisition',r['id'])
             elif action=='review':
                 self.allow('admin','manager'); require(r['created_by']!=self.user,'You cannot approve or reject your own requisition',403)
                 require(r['status']=='submitted','This request is not awaiting review',409)
                 decision=enum(data,'decision',{'approved','rejected'}); comment=text(data,'comment',decision=='rejected',2000)
+                self.lock('requisitions', r['id'])
                 self.db.execute('INSERT INTO approvals VALUES(?,?,?,?,?,?,?)',(record_id,self.org,r['id'],self.user,decision,comment,timestamp))
-                self.db.execute('UPDATE requisitions SET status=? WHERE id=?',(decision,r['id']))
+                changed=self.db.execute('UPDATE requisitions SET status=? WHERE org_id=? AND id=? AND status=?',(decision,self.org,r['id'],'submitted')).rowcount
+                require(changed==1,'This request changed before the review could be saved. Refresh and try again.',409)
                 self.notify(r['created_by'],f'Your requisition was {decision}','requisition',r['id']); self.audit(decision,'requisition',r['id'],{'comment':comment})
             elif action=='order':
                 self.allow('admin','manager'); require(r['status']=='approved','Only approved requisitions can become purchase orders',409)
                 supplier=self.one('suppliers',text(data,'supplier_id',limit=32))
                 require(r['unit_price']>0,'A priced requisition is required before ordering')
+                self.lock('requisitions', r['id'])
                 self.db.execute('INSERT INTO purchase_orders VALUES(?,?,?,?,?,?,?,?)',(record_id,self.org,r['id'],supplier['id'],r['quantity']*r['unit_price'],self.user,'issued',timestamp))
-                self.db.execute("UPDATE requisitions SET status='ordered' WHERE id=?",(r['id'],)); self.audit('issue_purchase_order','purchase_order',record_id,{'requisition_id':r['id']})
+                changed=self.db.execute("UPDATE requisitions SET status='ordered' WHERE org_id=? AND id=? AND status=?",(self.org,r['id'],'approved')).rowcount
+                require(changed==1,'This request changed before the purchase order could be issued. Refresh and try again.',409)
+                self.audit('issue_purchase_order','purchase_order',record_id,{'requisition_id':r['id']})
                 return self.one('purchase_orders',record_id)
             else: raise APIError(404,'Endpoint not found')
             return self.one('requisitions',r['id'])
@@ -557,8 +650,11 @@ class Service:
             rules={'issue':('draft','issued','1100 Accounts receivable','4000 Revenue'),'payment':('issued','paid','1000 Cash','1100 Accounts receivable'),'void':('issued','void','4000 Revenue','1100 Accounts receivable')}
             require(action in rules,'Unknown invoice action',404)
             before,after,debit,credit=rules[action]; require(inv['status']==before,f'Invoice must be {before} for this action',409)
+            self.lock('invoices', inv['id'])
             self.post_ledger(inv,action,debit,credit)
-            self.db.execute('UPDATE invoices SET status=? WHERE id=?',(after,inv['id'])); self.audit(action,'invoice',inv['id'],{'amount_cents':inv['total']})
+            changed=self.db.execute('UPDATE invoices SET status=? WHERE org_id=? AND id=? AND status=?',(after,self.org,inv['id'],before)).rowcount
+            require(changed==1,'This invoice changed before the action could be completed. Refresh and try again.',409)
+            self.audit(action,'invoice',inv['id'],{'amount_cents':inv['total']})
             return self.one('invoices',inv['id'])
         if path=='/api/documents':
             self.write(); p=self.project_id(data)
@@ -627,6 +723,7 @@ class Service:
         raise APIError(404,'Endpoint not found')
 
     def post_ledger(self, invoice, kind, debit, credit,posted_at=None):
+        require(invoice.get('org_id')==self.org,'Record not found',404)
         entry_id=uid(); amount=invoice['total']
         self.db.execute('INSERT INTO ledger_entries VALUES(?,?,?,?,?,?,?)',(entry_id,self.org,invoice['id'],kind,f'{kind}: {invoice["number"]}',self.user,posted_at or now()))
         self.db.executemany('INSERT INTO ledger_lines VALUES(?,?,?,?,?)',[(uid(),entry_id,debit,amount,0),(uid(),entry_id,credit,0,amount)])
@@ -637,9 +734,25 @@ class Service:
         parts=path.strip('/').split('/'); require(len(parts)==3,'Endpoint not found',404)
         table,record_id=parts[1],parts[2]; timestamp=now()
         if table=='people':
-            self.allow('admin'); member=self.member(record_id); role=enum(data,'role',ROLES,member['role'])
-            if member['role']=='admin' and role!='admin': require(self.db.execute("SELECT COUNT(*) FROM memberships WHERE org_id=? AND role='admin' AND active=1",(self.org,)).fetchone()[0]>1,'Workspace must retain an administrator')
-            self.db.execute('UPDATE memberships SET role=?,department=? WHERE org_id=? AND user_id=?',(role,text(data,'department',False,100),self.org,record_id)); self.audit('change_role','membership',record_id,{'role':role}); return {'ok':True}
+            self.allow('admin'); member=self.member(record_id, allow_inactive=True)
+            role=enum(data,'role',ROLES,member['role'])
+            department=text(data,'department',False,100)
+            active=bool(member['active'])
+            if 'active' in data:
+                require(isinstance(data['active'], bool), 'active must be true or false')
+                active=data['active']
+            was_active_admin=member['role']=='admin' and bool(member['active'])
+            target_active_admin=role=='admin' and active
+            if was_active_admin and not target_active_admin:
+                require(self.db.execute("SELECT COUNT(*) FROM memberships WHERE org_id=? AND role='admin' AND active=1 AND user_id!=?",(self.org,record_id)).fetchone()[0]>0,'Workspace must retain an administrator')
+            self.db.execute('UPDATE memberships SET role=?,department=?,active=? WHERE org_id=? AND user_id=?',(role,department,1 if active else 0,self.org,record_id))
+            if bool(member['active']) and not active:
+                self.db.execute('DELETE FROM sessions WHERE org_id=? AND user_id=?',(self.org,record_id))
+            details={'role':role,'department':department,'active':active}
+            self.audit('change_role','membership',record_id,details)
+            if bool(member['active']) != active:
+                self.audit('reactivate_member' if active else 'deactivate_member','membership',record_id,details)
+            return {'ok':True}
         self.write()
         if table=='tasks':
             task=self.visible_record('tasks',record_id)
@@ -673,7 +786,7 @@ class Service:
         if table=='requisitions':
             r=self.visible_record('requisitions',record_id)
             require(r['created_by']==self.user,'Only the requester may edit',403); require(r['status'] in ('draft','rejected'),'Submitted requisitions cannot be edited',409)
-            self.db.execute('UPDATE requisitions SET item=?,quantity=?,unit_price=?,notes=?,status=? WHERE id=?',(text(data,'item',limit=200),integer(data,'quantity'),money(data,'unit_price'),text(data,'notes',False,10000),'draft',record_id)); self.audit('edit_draft','requisition',record_id); return self.one('requisitions',record_id)
+            self.db.execute('UPDATE requisitions SET item=?,quantity=?,unit_price=?,notes=?,status=? WHERE org_id=? AND id=?',(text(data,'item',limit=200),integer(data,'quantity'),money(data,'unit_price'),text(data,'notes',False,10000),'draft',self.org,record_id)); self.audit('edit_draft','requisition',record_id); return self.one('requisitions',record_id)
         if table=='assets':
             self.allow('admin','manager'); self.visible_record('assets',record_id)
             status=enum(data,'status',{'available','assigned','maintenance','retired'})
@@ -693,17 +806,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         # Avoid logging invitations, queries or message contents.
-        print(f'{self.address_string()} {self.command} {urlsplit(self.path).path} {args[1] if len(args)>1 else ""}',flush=True)
+        rid=getattr(self,'request_id','-')
+        print(f'{self.address_string()} {self.command} {urlsplit(self.path).path} {args[1] if len(args)>1 else ""} rid={rid}',flush=True)
 
     def headers_common(self,allow_frame=False):
+        request_id=getattr(self,'request_id','')
+        if request_id:
+            self.send_header('X-Request-ID',request_id)
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('X-Frame-Options','SAMEORIGIN' if allow_frame else 'DENY')
         self.send_header('Referrer-Policy','no-referrer')
         self.send_header('Cache-Control','no-store')
+        self.send_header('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=(), usb=()')
+        self.send_header('Cross-Origin-Opener-Policy','same-origin')
+        self.send_header('Cross-Origin-Resource-Policy','same-origin')
+        self.send_header('X-Permitted-Cross-Domain-Policies','none')
+        self.send_header('Origin-Agent-Cluster','?1')
+        if os.environ.get('NEXUS_SECURE_COOKIE')=='1':
+            self.send_header('Strict-Transport-Security','max-age=31536000; includeSubDomains')
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors "+("'self'" if allow_frame else "'none'")+"; base-uri 'none'; form-action 'self'")
 
     def reply(self, value, status=200, cookie=None):
+        if status >= 400 and isinstance(value, dict) and 'error' in value and 'request_id' not in value:
+            value = {**value, 'request_id': getattr(self, 'request_id', '')}
         payload=json.dumps(value,ensure_ascii=False).encode('utf-8')
+        idem=getattr(self,'_idem',None); idem_db=getattr(self,'_idem_db',None)
+        if idem and idem_db and status<500:
+            org_id,user_id,key,method,path,fp=idem
+            try:
+                idem_db.execute('INSERT OR IGNORE INTO idempotency_keys(org_id,user_id,key,method,path,fingerprint,status,body,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(org_id,user_id,key,method,path,fp,status,payload.decode('utf-8'),now()))
+                idem_db.commit()
+            except Exception:
+                try: idem_db.rollback()
+                except Exception: pass
         self.send_response(status); self.headers_common(); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(payload)))
         if cookie: self.send_header('Set-Cookie',cookie)
         self.end_headers(); self.wfile.write(payload)
@@ -753,13 +888,18 @@ class Handler(BaseHTTPRequestHandler):
         require(isinstance(password,str) and 0<len(password)<=1024,'Password is required (maximum 1024 characters)')
         require(re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email),'Enter a valid email')
         key=digest(self.client_address[0]+'|'+email); current=int(time.time())
+        ip_key=digest('ip|'+self.client_address[0]+'|'+path)
         attempt=db.execute('SELECT * FROM login_attempts WHERE key=?',(key,)).fetchone()
+        ip_attempt=db.execute('SELECT * FROM login_attempts WHERE key=?',(ip_key,)).fetchone()
         require(not attempt or current-attempt['window_start']>=900 or attempt['failures']<10,'Too many attempts. Try again in 15 minutes.',429)
+        require(not ip_attempt or current-ip_attempt['window_start']>=900 or ip_attempt['failures']<40,'Too many authentication attempts from this network. Try again in 15 minutes.',429)
         user=db.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
         if path=='/api/auth/login':
             valid=password_valid(password,user['password_hash'] if user else 'pbkdf2_sha256$600000$'+'00'*16+'$'+'00'*32)
             if not user or not valid:
-                db.execute('INSERT INTO login_attempts VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN ?-window_start>=900 THEN 1 ELSE failures+1 END,window_start=CASE WHEN ?-window_start>=900 THEN ? ELSE window_start END',(key,current,current,current,current)); db.commit()
+                for attempt_key, window in ((key, 900), (ip_key, 900)):
+                    db.execute('INSERT INTO login_attempts VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN ?-login_attempts.window_start>=? THEN 1 ELSE login_attempts.failures+1 END,window_start=CASE WHEN ?-login_attempts.window_start>=? THEN ? ELSE login_attempts.window_start END',(attempt_key,current,current,window,current,window,current))
+                db.commit()
                 raise APIError(401,'Email or password is incorrect')
             org=db.execute('SELECT org_id FROM memberships WHERE user_id=? AND active=1 ORDER BY org_id',(user['id'],)).fetchone()
             require(org is not None,'No active organization membership',403)
@@ -775,7 +915,7 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('INSERT INTO organizations(id,name,industry,currency,created_at) VALUES(?,?,?,?,?)',(org_id,org_name,text(data,'industry',False,100) or 'General',currency,timestamp))
             db.execute('INSERT INTO memberships(org_id,user_id,role) VALUES(?,?,?)',(org_id,user_id,'admin'))
             db.execute('INSERT INTO conversations VALUES(?,?,?,?,?,?,?)',(uid(),org_id,'general','channel',None,user_id,timestamp))
-            service=Service(db,{'org_id':org_id,'user_id':user_id,'role':'admin'})
+            service=Service(db,{'org_id':org_id,'user_id':user_id,'role':'admin','request_id':getattr(self,'request_id','')})
             service.audit('create_workspace','organization',org_id)
             return self.session(db,user_id,org_id)
         if path=='/api/auth/join':
@@ -783,20 +923,33 @@ class Handler(BaseHTTPRequestHandler):
             invitation=db.execute('SELECT * FROM invitations WHERE token_hash=? AND accepted_at IS NULL AND expires_at>?',(digest(token),current)).fetchone()
             require(invitation is not None and invitation['email'].lower()==email,'Invalid or expired invitation',400)
             if user:
-                require(password_valid(password,user['password_hash']),'Email or password is incorrect',401); user_id=user['id']
+                if not password_valid(password,user['password_hash']):
+                    for attempt_key, window in ((key, 900), (ip_key, 900)):
+                        db.execute('INSERT INTO login_attempts VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN ?-login_attempts.window_start>=? THEN 1 ELSE login_attempts.failures+1 END,window_start=CASE WHEN ?-login_attempts.window_start>=? THEN ? ELSE login_attempts.window_start END',(attempt_key,current,current,window,current,window,current))
+                    db.commit()
+                    raise APIError(401,'Email or password is incorrect')
+                user_id=user['id']
             else:
                 user_id=uid(); db.execute('INSERT INTO users VALUES(?,?,?,?,?)',(user_id,email,text(data,'name',limit=160),password_hash(password),now()))
             existing=db.execute('SELECT 1 FROM memberships WHERE org_id=? AND user_id=?',(invitation['org_id'],user_id)).fetchone()
             require(existing is None,'You already belong to this workspace',409)
             db.execute('INSERT INTO memberships(org_id,user_id,role,department) VALUES(?,?,?,?)',(invitation['org_id'],user_id,invitation['role'],invitation['department']))
             db.execute('UPDATE invitations SET accepted_at=? WHERE id=?',(now(),invitation['id']))
-            Service(db,{'org_id':invitation['org_id'],'user_id':user_id,'role':invitation['role']}).audit('accept_invitation','membership',user_id)
+            Service(db,{'org_id':invitation['org_id'],'user_id':user_id,'role':invitation['role'],'request_id':getattr(self,'request_id','')}).audit('accept_invitation','membership',user_id)
             return self.session(db,user_id,invitation['org_id'])
         raise APIError(404,'Endpoint not found')
 
     def dispatch(self):
-        path=urlsplit(self.path).path
+        raw_path=urlsplit(self.path)
+        path=raw_path.path
+        incoming=self.headers.get('X-Request-ID','').strip()
+        self.request_id=incoming if REQUEST_ID_RE.fullmatch(incoming) else secrets.token_hex(16)
         try:
+            if path.startswith('/api/'):
+                limit = RATE_LIMIT_GET if self.command == 'GET' else RATE_LIMIT_MUTATE
+                bucket_key = f"api:{self.client_address[0]}:{self.command}"
+                if not rate_allow(bucket_key, limit, 60):
+                    raise APIError(429, 'Too many requests. Please slow down and retry shortly.')
             # Consume bounded bodies before returning an authorization error, avoiding
             # a TCP reset when a client is still sending its request.
             if self.command!='GET': self.body()
@@ -804,7 +957,7 @@ class Handler(BaseHTTPRequestHandler):
             host=self.headers.get('Host','').split(':')[0].lower()
             allowed={'127.0.0.1','localhost'}|set(os.environ.get('NEXUS_ALLOWED_HOSTS','').lower().split(','))
             require(host in allowed,'Host is not allowed',403)
-            if path=='/api/health' and self.command=='GET': return self.reply({'status':'ok','database':'sqlite','schema_version':5,'release':'2.1'})
+            if path=='/api/health' and self.command=='GET': return self.reply({'status':'ok','database':db_backend(),'schema_version':6,'release':'2.1'})
             if not path.startswith('/api/'):
                 require(self.command=='GET','Method not allowed',405)
                 files={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/style.css':'style.css','/premium.css':'premium.css','/icons.js':'icons.js','/experience.js':'experience.js','/automation.js':'automation.js','/favicon.svg':'favicon.svg','/pdf-preview.html':'pdf-preview.html','/pdf-viewer.js':'pdf-viewer.js','/pdf-viewer.css':'pdf-viewer.css'}
@@ -824,14 +977,25 @@ class Handler(BaseHTTPRequestHandler):
                     key=digest('demo|'+self.client_address[0]);current=int(time.time())
                     attempt=db.execute('SELECT * FROM login_attempts WHERE key=?',(key,)).fetchone()
                     require(not attempt or current-attempt['window_start']>=3600 or attempt['failures']<10,'Demo creation is limited to ten workspaces per hour',429)
-                    db.execute('INSERT INTO login_attempts VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN ?-window_start>=3600 THEN 1 ELSE failures+1 END,window_start=CASE WHEN ?-window_start>=3600 THEN ? ELSE window_start END',(key,current,current,current,current))
+                    db.execute('INSERT INTO login_attempts VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN ?-login_attempts.window_start>=3600 THEN 1 ELSE login_attempts.failures+1 END,window_start=CASE WHEN ?-login_attempts.window_start>=3600 THEN ? ELSE login_attempts.window_start END',(key,current,current,current,current))
                     user_id=uid();db.execute('INSERT INTO users VALUES(?,?,?,?,?)',(user_id,'demo-'+user_id+'@example.invalid','Alex Morgan',password_hash(secrets.token_urlsafe(48)),now()))
                     import demo_data
                     org_id=demo_data.seed_demo(db,user_id,Service,password_hash)
                     value,cookie=self.session(db,user_id,org_id);db.commit();return self.reply(value,cookie=cookie)
                 if path in ('/api/auth/register','/api/auth/login','/api/auth/join') and self.command=='POST':
                     value,cookie=self.auth(db,path,self.body()); db.commit(); return self.reply(value,cookie=cookie)
-                identity=self.identity(db); service=Service(db,identity)
+                identity=self.identity(db); identity['request_id']=self.request_id; service=Service(db,identity)
+                idem_key=self.headers.get('Idempotency-Key','').strip()[:128] if self.command in ('POST','PUT','PATCH','DELETE') else ''
+                if idem_key:
+                    idem_fp=hashlib.sha256(json.dumps(self.body(),sort_keys=True,separators=(',',':')).encode()).hexdigest()
+                    existing=db.execute('SELECT method,path,fingerprint,status,body FROM idempotency_keys WHERE org_id=? AND user_id=? AND key=?',(identity['org_id'],identity['user_id'],idem_key)).fetchone()
+                    if existing:
+                        if existing['method']!=self.command or existing['path']!=path:
+                            raise APIError(409,'Idempotency key was already used for a different request')
+                        if existing['fingerprint'] and existing['fingerprint']!=idem_fp:
+                            raise APIError(409,'Idempotency key was already used with a different request payload')
+                        db.rollback(); self.reply(json.loads(existing['body']), status=existing['status']); return
+                    self._idem=(identity['org_id'],identity['user_id'],idem_key,self.command,path,idem_fp); self._idem_db=db
                 if path=='/api/workflows' or path.startswith('/api/workflows/'):
                     engine=workflows.Workflows(service,require);parts=path.split('/')
                     if self.command=='GET':value=engine.list() if len(parts)==3 else engine.detail(parts[3])
@@ -903,13 +1067,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(value)
         except APIError as exc:
             self.reply({'error':exc.message},exc.status)
-        except sqlite3.IntegrityError:
-            self.reply({'error':'This operation conflicts with an existing record or record constraint.'},409)
-        except sqlite3.OperationalError:
-            self.reply({'error':'Database is busy or unavailable. Please retry.'},503)
-        except (BrokenPipeError,ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
+            pg_types = nexus_db.postgres_exception_types()
+            integrity_types = (sqlite3.IntegrityError,) + tuple(t for t in pg_types if 'Integrity' in getattr(t, '__name__', ''))
+            operational_types = (sqlite3.OperationalError,) + tuple(t for t in pg_types if 'Operational' in getattr(t, '__name__', ''))
+            if isinstance(exc, integrity_types):
+                detail=str(exc)
+                message='This operation conflicts with an existing record or record constraint.'
+                if 'purchase_orders.requisition_id' in detail and 'UNIQUE' in detail.upper():
+                    message='A purchase order has already been issued for this requisition.'
+                elif 'invoices' in detail and 'number' in detail and 'UNIQUE' in detail.upper():
+                    message='An invoice with this number already exists in this workspace.'
+                elif 'ledger_entries.invoice_id' in detail and 'kind' in detail and 'UNIQUE' in detail.upper():
+                    message='This invoice action has already been recorded.'
+                elif ('approvals' in detail or 'requisition_stage_decisions' in detail) and 'UNIQUE' in detail.upper():
+                    message='This approval decision conflicts with an existing review record.'
+                self.reply({'error':message},409)
+                return
+            if isinstance(exc, operational_types):
+                self.reply({'error':'Database is busy or unavailable. Please retry.'},503)
+                return
             # Trace server-side failures for operators; never include request bodies or credentials.
             import traceback
             traceback.print_exc()
@@ -926,7 +1105,17 @@ def main():
     args=parser.parse_args(); initialize()
     server=ThreadingHTTPServer((args.host,args.port),Handler)
     print(f'NEXUS is running at http://{args.host}:{args.port}',flush=True)
-    print(f'Database: {DB_PATH}',flush=True)
+    db_label = os.environ.get('NEXUS_DATABASE_URL') or os.environ.get('NEXUS_DB_URL') or str(DB_PATH)
+    if db_is_postgres():
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+            u=urlsplit(db_label)
+            host=u.hostname or ''
+            if u.port: host += ':'+str(u.port)
+            db_label=urlunsplit((u.scheme, '***@'+host, u.path, '', ''))
+        except Exception:
+            db_label='postgresql://<redacted>'
+    print(f'Database ({db_backend()}): {db_label}',flush=True)
     stop=threading.Event()
     def automation_worker():
         import sys

@@ -5,7 +5,6 @@ import threading
 from urllib.error import URLError
 from urllib.request import urlopen
 import webbrowser
-import os
 import server
 
 def main():
@@ -22,8 +21,7 @@ def main():
                 return
     except (URLError,TimeoutError,OSError,ValueError):pass
     server.initialize()
-    host='0.0.0.0' if os.environ.get('PORT') else '127.0.0.1'
-    try:http=server.ThreadingHTTPServer((host,args.port),server.Handler)
+    try:http=server.ThreadingHTTPServer(('127.0.0.1',args.port),server.Handler)
     except OSError:
         raise SystemExit(f'Port {args.port} is in use. Close the other application or use --port with another number.')
     print('\nNEXUS BUSINESS SYSTEM\n'+url+'\n')

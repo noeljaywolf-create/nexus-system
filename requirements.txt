@@ -1,2 +1,0 @@
-# Nexus uses only the Python standard library (Python 3.11+).
-# No third-party packages are required.

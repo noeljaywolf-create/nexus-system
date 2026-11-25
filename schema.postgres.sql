@@ -1,0 +1,614 @@
+-- Nexus PostgreSQL schema (RDBMS migration target)
+-- Translated from schema.sql (SQLite). Preserves business semantics while using
+-- PostgreSQL types, constraints, indexes, and trigger functions suitable for
+-- row-level locking / transactional workloads.
+--
+-- Concurrency notes:
+-- - Use transactions with SELECT ... FOR UPDATE on contended rows (e.g. invoices,
+--   requisitions) before state transitions.
+-- - Keep UNIQUE constraints as final idempotency/double-post guards.
+-- - Use READ COMMITTED (default) with explicit row locks, or SERIALIZABLE for
+--   stricter isolation where needed. Avoid long transactions.
+-- - Add connection pooling (PgBouncer/pgpool) and statement timeouts in deployment.
+
+CREATE EXTENSION IF NOT EXISTS citext;
+
+CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY);
+INSERT INTO schema_version(version) VALUES (1) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS organizations(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  industry TEXT NOT NULL DEFAULT 'General',
+  currency TEXT NOT NULL DEFAULT 'USD',
+  created_at TIMESTAMPTZ NOT NULL,
+  message_edit_minutes INTEGER NOT NULL DEFAULT 15 CHECK (message_edit_minutes BETWEEN 0 AND 1440)
+);
+
+CREATE TABLE IF NOT EXISTS users(
+  id TEXT PRIMARY KEY,
+  email CITEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memberships(
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  role TEXT NOT NULL CHECK (role IN ('admin','manager','finance','member','viewer')),
+  department TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+  PRIMARY KEY (org_id,user_id)
+);
+CREATE INDEX IF NOT EXISTS memberships_user_active ON memberships(user_id, active);
+
+CREATE TABLE IF NOT EXISTS sessions(
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  csrf TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  last_seen BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_org_user ON sessions(org_id, user_id);
+
+CREATE TABLE IF NOT EXISTS login_attempts(
+  key TEXT PRIMARY KEY,
+  failures INTEGER NOT NULL,
+  window_start BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS invitations(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  email CITEXT NOT NULL,
+  role TEXT NOT NULL,
+  department TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  expires_at BIGINT NOT NULL,
+  accepted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS customers(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  email TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  company TEXT NOT NULL DEFAULT '',
+  stage TEXT NOT NULL DEFAULT 'lead' CHECK (stage IN ('lead','qualified','customer','inactive')),
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS suppliers(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  email TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS products(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  unit TEXT NOT NULL DEFAULT 'each',
+  unit_price BIGINT NOT NULL DEFAULT 0 CHECK (unit_price>=0),
+  stock BIGINT NOT NULL DEFAULT 0 CHECK (stock>=0),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  UNIQUE (org_id,sku)
+);
+
+CREATE TABLE IF NOT EXISTS stock_movements(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  quantity BIGINT NOT NULL,
+  reason TEXT NOT NULL,
+  actor_id TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (org_id,product_id) REFERENCES products(org_id,id)
+);
+
+CREATE OR REPLACE FUNCTION prevent_mutation() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION '% is immutable', TG_TABLE_NAME;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS immutable_stock_movement_update ON stock_movements;
+CREATE TRIGGER immutable_stock_movement_update BEFORE UPDATE ON stock_movements FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_stock_movement_delete ON stock_movements;
+CREATE TRIGGER immutable_stock_movement_delete BEFORE DELETE ON stock_movements FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+
+CREATE TABLE IF NOT EXISTS projects(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  owner_id TEXT NOT NULL,
+  private INTEGER NOT NULL DEFAULT 0 CHECK (private IN (0,1)),
+  budget BIGINT NOT NULL DEFAULT 0 CHECK (budget>=0),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','at_risk','complete','archived')),
+  due_date TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  FOREIGN KEY (org_id,owner_id) REFERENCES memberships(org_id,user_id)
+);
+
+CREATE TABLE IF NOT EXISTS project_members(
+  org_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  PRIMARY KEY (project_id,user_id),
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id),
+  FOREIGN KEY (org_id,user_id) REFERENCES memberships(org_id,user_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversations(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('channel','project','direct')),
+  project_id TEXT,
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  UNIQUE (project_id),
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_members(
+  org_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  last_read TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (conversation_id,user_id),
+  FOREIGN KEY (org_id,conversation_id) REFERENCES conversations(org_id,id),
+  FOREIGN KEY (org_id,user_id) REFERENCES memberships(org_id,user_id)
+);
+
+CREATE TABLE IF NOT EXISTS messages(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  author_id TEXT NOT NULL REFERENCES users(id),
+  body TEXT NOT NULL,
+  parent_id TEXT,
+  edited_at TIMESTAMPTZ,
+  deleted_at TIMESTAMPTZ,
+  pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0,1)),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  UNIQUE (conversation_id,id),
+  FOREIGN KEY (org_id,conversation_id) REFERENCES conversations(org_id,id),
+  FOREIGN KEY (conversation_id,parent_id) REFERENCES messages(conversation_id,id)
+);
+CREATE INDEX IF NOT EXISTS message_conversation_time ON messages(conversation_id,created_at);
+
+CREATE TABLE IF NOT EXISTS message_history(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  actor_id TEXT NOT NULL REFERENCES users(id),
+  reason TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (org_id,message_id) REFERENCES messages(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS reactions(
+  org_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  emoji TEXT NOT NULL,
+  PRIMARY KEY (message_id,user_id,emoji),
+  FOREIGN KEY (org_id,message_id) REFERENCES messages(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS attachments(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  content BYTEA NOT NULL,
+  uploaded_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (org_id,conversation_id) REFERENCES conversations(org_id,id),
+  FOREIGN KEY (conversation_id,message_id) REFERENCES messages(conversation_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS tasks(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  project_id TEXT,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  assignee_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('todo','doing','done')),
+  priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('low','normal','high')),
+  due_date TEXT NOT NULL DEFAULT '',
+  source_message_id TEXT,
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id),
+  FOREIGN KEY (org_id,assignee_id) REFERENCES memberships(org_id,user_id),
+  FOREIGN KEY (org_id,source_message_id) REFERENCES messages(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS requisitions(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  project_id TEXT,
+  item TEXT NOT NULL,
+  quantity BIGINT NOT NULL CHECK (quantity>0),
+  unit_price BIGINT NOT NULL DEFAULT 0 CHECK (unit_price>=0),
+  notes TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','submitted','approved','rejected','ordered')),
+  source_message_id TEXT,
+  created_by TEXT NOT NULL REFERENCES users(id),
+  submitted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id),
+  FOREIGN KEY (org_id,source_message_id) REFERENCES messages(org_id,id)
+);
+CREATE INDEX IF NOT EXISTS requisitions_org_status ON requisitions(org_id,status);
+
+CREATE TABLE IF NOT EXISTS approvals(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  requisition_id TEXT NOT NULL,
+  reviewer_id TEXT NOT NULL REFERENCES users(id),
+  decision TEXT NOT NULL CHECK (decision IN ('approved','rejected')),
+  comment TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (org_id,requisition_id) REFERENCES requisitions(org_id,id)
+);
+CREATE INDEX IF NOT EXISTS approvals_org_requisition ON approvals(org_id,requisition_id);
+DROP TRIGGER IF EXISTS immutable_approval_update ON approvals;
+CREATE TRIGGER immutable_approval_update BEFORE UPDATE ON approvals FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_approval_delete ON approvals;
+CREATE TRIGGER immutable_approval_delete BEFORE DELETE ON approvals FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+
+CREATE TABLE IF NOT EXISTS purchase_orders(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  requisition_id TEXT NOT NULL UNIQUE,
+  supplier_id TEXT NOT NULL,
+  total BIGINT NOT NULL CHECK (total>=0),
+  created_by TEXT NOT NULL REFERENCES users(id),
+  status TEXT NOT NULL DEFAULT 'issued',
+  created_at TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (org_id,requisition_id) REFERENCES requisitions(org_id,id),
+  FOREIGN KEY (org_id,supplier_id) REFERENCES suppliers(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS invoices(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  number TEXT NOT NULL,
+  customer_id TEXT NOT NULL,
+  description TEXT NOT NULL,
+  total BIGINT NOT NULL CHECK (total>0),
+  due_date TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','issued','paid','void')),
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  UNIQUE (org_id,number),
+  FOREIGN KEY (org_id,customer_id) REFERENCES customers(org_id,id)
+);
+CREATE INDEX IF NOT EXISTS invoices_org_status ON invoices(org_id,status);
+
+CREATE TABLE IF NOT EXISTS ledger_entries(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  invoice_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('issue','payment','void')),
+  description TEXT NOT NULL,
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (invoice_id,kind),
+  FOREIGN KEY (org_id,invoice_id) REFERENCES invoices(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS ledger_lines(
+  id TEXT PRIMARY KEY,
+  entry_id TEXT NOT NULL REFERENCES ledger_entries(id),
+  account TEXT NOT NULL CHECK (account IN ('1000 Cash','1100 Accounts receivable','4000 Revenue')),
+  debit BIGINT NOT NULL DEFAULT 0 CHECK (debit>=0),
+  credit BIGINT NOT NULL DEFAULT 0 CHECK (credit>=0),
+  CHECK ((debit>0 AND credit=0) OR (credit>0 AND debit=0))
+);
+DROP TRIGGER IF EXISTS immutable_ledger_line_update ON ledger_lines;
+CREATE TRIGGER immutable_ledger_line_update BEFORE UPDATE ON ledger_lines FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_ledger_line_delete ON ledger_lines;
+CREATE TRIGGER immutable_ledger_line_delete BEFORE DELETE ON ledger_lines FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_ledger_entry_update ON ledger_entries;
+CREATE TRIGGER immutable_ledger_entry_update BEFORE UPDATE ON ledger_entries FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_ledger_entry_delete ON ledger_entries;
+CREATE TRIGGER immutable_ledger_entry_delete BEFORE DELETE ON ledger_entries FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+
+CREATE TABLE IF NOT EXISTS documents(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  project_id TEXT,
+  created_by TEXT NOT NULL REFERENCES users(id),
+  updated_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS meetings(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  title TEXT NOT NULL,
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ NOT NULL,
+  project_id TEXT,
+  notes TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS meeting_attendees(
+  org_id TEXT NOT NULL,
+  meeting_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  rsvp TEXT NOT NULL DEFAULT 'pending' CHECK (rsvp IN ('pending','accepted','declined')),
+  PRIMARY KEY (meeting_id,user_id),
+  FOREIGN KEY (org_id,meeting_id) REFERENCES meetings(org_id,id),
+  FOREIGN KEY (org_id,user_id) REFERENCES memberships(org_id,user_id)
+);
+
+CREATE TABLE IF NOT EXISTS notifications(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  text TEXT NOT NULL,
+  record_type TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  read_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log(
+  seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  id TEXT NOT NULL UNIQUE,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  actor_id TEXT NOT NULL REFERENCES users(id),
+  action TEXT NOT NULL,
+  record_type TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  details TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+DROP TRIGGER IF EXISTS immutable_audit_update ON audit_log;
+CREATE TRIGGER immutable_audit_update BEFORE UPDATE ON audit_log FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_audit_delete ON audit_log;
+CREATE TRIGGER immutable_audit_delete BEFORE DELETE ON audit_log FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+
+CREATE TABLE IF NOT EXISTS organization_units(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('branch','department')),
+  location TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  UNIQUE (org_id,name,kind)
+);
+
+CREATE TABLE IF NOT EXISTS assets(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  category TEXT NOT NULL,
+  assignee_id TEXT,
+  project_id TEXT,
+  purchase_value BIGINT NOT NULL CHECK (purchase_value>=0),
+  status TEXT NOT NULL CHECK (status IN ('available','assigned','maintenance','retired')),
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  UNIQUE (org_id,tag),
+  FOREIGN KEY (org_id,assignee_id) REFERENCES memberships(org_id,user_id),
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS contracts(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  title TEXT NOT NULL,
+  counterparty TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('customer','supplier','employment','other')),
+  value BIGINT NOT NULL CHECK (value>=0),
+  starts_on TEXT NOT NULL,
+  ends_on TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('draft','active','closed')),
+  project_id TEXT,
+  notes TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id),
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS installed_packages(
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  package_id TEXT NOT NULL,
+  contract_version INTEGER NOT NULL,
+  enabled_at TIMESTAMPTZ NOT NULL,
+  enabled_by TEXT NOT NULL REFERENCES users(id),
+  PRIMARY KEY (org_id,package_id)
+);
+
+CREATE TABLE IF NOT EXISTS extension_records(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  package_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (org_id,project_id) REFERENCES projects(org_id,id),
+  FOREIGN KEY (org_id,package_id) REFERENCES installed_packages(org_id,package_id)
+);
+
+INSERT INTO schema_version(version) VALUES (2) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS conversation_records(
+  org_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL UNIQUE,
+  record_kind TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  PRIMARY KEY (org_id,record_kind,record_id),
+  FOREIGN KEY (org_id,conversation_id) REFERENCES conversations(org_id,id)
+);
+
+INSERT INTO schema_version(version) VALUES (3) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS document_metadata(
+  org_id TEXT NOT NULL,
+  document_id TEXT PRIMARY KEY,
+  folder TEXT NOT NULL DEFAULT 'General',
+  tags TEXT NOT NULL DEFAULT '[]',
+  archived_at TIMESTAMPTZ,
+  record_kind TEXT,
+  record_id TEXT,
+  FOREIGN KEY (org_id,document_id) REFERENCES documents(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS document_files(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  document_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version>0),
+  filename TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size BIGINT NOT NULL CHECK (size>0 AND size=octet_length(content)),
+  sha256 TEXT NOT NULL CHECK (length(sha256)=64),
+  content BYTEA NOT NULL,
+  uploaded_by TEXT NOT NULL REFERENCES users(id),
+  version_note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (document_id,version),
+  FOREIGN KEY (org_id,document_id) REFERENCES documents(org_id,id)
+);
+CREATE INDEX IF NOT EXISTS document_file_latest ON document_files(document_id,version DESC);
+DROP TRIGGER IF EXISTS immutable_document_file_update ON document_files;
+CREATE TRIGGER immutable_document_file_update BEFORE UPDATE ON document_files FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_document_file_delete ON document_files;
+CREATE TRIGGER immutable_document_file_delete BEFORE DELETE ON document_files FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+
+CREATE TABLE IF NOT EXISTS demo_workspaces(
+  org_id TEXT PRIMARY KEY REFERENCES organizations(id),
+  owner_id TEXT NOT NULL UNIQUE REFERENCES users(id),
+  seed_version INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+INSERT INTO schema_version(version) VALUES (4) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS workflow_rules(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  owner_id TEXT NOT NULL REFERENCES users(id),
+  active_version INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_versions(
+  org_id TEXT NOT NULL,
+  rule_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  definition TEXT NOT NULL,
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (rule_id,version),
+  FOREIGN KEY (org_id,rule_id) REFERENCES workflow_rules(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_runs(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  rule_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  run_day TEXT NOT NULL,
+  trigger_kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  matched INTEGER NOT NULL,
+  applied INTEGER NOT NULL,
+  skipped INTEGER NOT NULL,
+  error TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (org_id,rule_id) REFERENCES workflow_rules(org_id,id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_effects(
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  rule_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  run_day TEXT NOT NULL,
+  output_kind TEXT NOT NULL,
+  output_id TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (rule_id,source_kind,source_id,run_day),
+  FOREIGN KEY (org_id,rule_id) REFERENCES workflow_rules(org_id,id)
+);
+CREATE INDEX IF NOT EXISTS workflow_output_lookup ON workflow_effects(org_id,output_kind,output_id);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys(
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  key TEXT NOT NULL,
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  fingerprint TEXT NOT NULL DEFAULT '',
+  status INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (org_id,user_id,key)
+);
+CREATE INDEX IF NOT EXISTS idempotency_keys_created ON idempotency_keys(created_at);
+
+DROP TRIGGER IF EXISTS immutable_workflow_version_update ON workflow_versions;
+CREATE TRIGGER immutable_workflow_version_update BEFORE UPDATE ON workflow_versions FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_workflow_version_delete ON workflow_versions;
+CREATE TRIGGER immutable_workflow_version_delete BEFORE DELETE ON workflow_versions FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_workflow_run_update ON workflow_runs;
+CREATE TRIGGER immutable_workflow_run_update BEFORE UPDATE ON workflow_runs FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+DROP TRIGGER IF EXISTS immutable_workflow_run_delete ON workflow_runs;
+CREATE TRIGGER immutable_workflow_run_delete BEFORE DELETE ON workflow_runs FOR EACH ROW EXECUTE FUNCTION prevent_mutation();
+
+INSERT INTO schema_version(version) VALUES (5) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version(version) VALUES (6) ON CONFLICT DO NOTHING;
+
+-- Recommended transactional patterns (application layer):
+--   BEGIN;
+--   SELECT id FROM invoices WHERE org_id=$1 AND id=$2 FOR UPDATE;
+--   -- validate status/role/tenant, then insert ledger + update status
+--   COMMIT;
+-- Use UNIQUE constraints as last-line guards against races.

@@ -4,6 +4,9 @@ import binascii
 import hashlib
 import io
 import json
+import os
+import subprocess
+import tempfile
 from pathlib import PurePath
 import uuid
 import zipfile
@@ -15,6 +18,21 @@ PREVIEWABLE={'application/pdf','image/png','image/jpeg','text/plain','text/csv',
 
 def timestamp():return datetime.now(timezone.utc).isoformat(timespec='microseconds')
 def new_id():return uuid.uuid4().hex
+
+def scan_upload(content, filename):
+    cmd=os.environ.get('NEXUS_UPLOAD_SCAN_CMD','').strip()
+    if not cmd: return
+    suffix=PurePath(filename).suffix
+    fd,path=tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd,'wb') as f: f.write(content)
+        rendered=cmd.replace('{file}', path)
+        proc=subprocess.run(rendered, shell=True, capture_output=True, text=True, timeout=int(os.environ.get('NEXUS_UPLOAD_SCAN_TIMEOUT','20')))
+        if proc.returncode!=0:
+            raise ValueError('Upload blocked by security scan')
+    finally:
+        try: os.remove(path)
+        except Exception: pass
 
 class DocumentStore:
     def __init__(self,service,require,text,error):
@@ -83,6 +101,8 @@ class DocumentStore:
 
     def upload(self,data,document_id=None):
         self.s.write();filename,mime,content=self.parse_file(data);created=timestamp()
+        try: scan_upload(content, filename)
+        except ValueError as exc: raise self.error(400,str(exc))
         if document_id:
             doc=self.authorize(document_id)
             self.require(self.s.role in ('admin','manager') or doc['created_by']==self.s.user,'Only the document owner or a manager may upload a version',403)

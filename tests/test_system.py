@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,6 +17,72 @@ import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import server
+
+PG_TEST_URL = os.environ.get('NEXUS_TEST_DATABASE_URL') or os.environ.get('NEXUS_DATABASE_URL') or os.environ.get('NEXUS_DB_URL') or ''
+
+
+def _is_pg_test():
+    return server.nexus_db.is_postgres_url(PG_TEST_URL)
+
+
+def _db_errors():
+    errs = [sqlite3.IntegrityError, sqlite3.DatabaseError]
+    try:
+        import psycopg
+        errs.extend([psycopg.Error, psycopg.IntegrityError, psycopg.DatabaseError])
+    except Exception:
+        pass
+    try:
+        import psycopg2
+        errs.extend([psycopg2.Error, psycopg2.IntegrityError, psycopg2.DatabaseError])
+    except Exception:
+        pass
+    for name in ('IntegrityError', 'DatabaseError'):
+        e = getattr(server.nexus_db, name, None)
+        if e is not None:
+            errs.append(e)
+    out = []
+    for e in errs:
+        if isinstance(e, type) and e not in out:
+            out.append(e)
+    return tuple(out)
+
+
+DB_ERRORS = _db_errors()
+INTEGRITY_ERRORS = DB_ERRORS
+
+
+def _pg_admin_url(url):
+    # connect to postgres maintenance db for create/drop
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url)
+    path = '/postgres'
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+
+
+def _pg_db_name(url):
+    from urllib.parse import urlsplit
+    return urlsplit(url).path.lstrip('/') or 'postgres'
+
+
+def _create_pg_test_db(base_url):
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(base_url)
+    dbname = 'nexus_test_' + uuid.uuid4().hex[:12]
+    admin_url = urlunsplit((parts.scheme, parts.netloc, '/postgres', parts.query, parts.fragment))
+    test_url = urlunsplit((parts.scheme, parts.netloc, '/' + dbname, parts.query, parts.fragment))
+    import psycopg
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        conn.execute(f'CREATE DATABASE {dbname}')
+    return test_url, dbname, admin_url
+
+
+def _drop_pg_test_db(test_url, dbname, admin_url):
+    import psycopg
+    # close any lingering connections in server pool? server uses direct connects; just drop with force
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        conn.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=%s AND pid <> pg_backend_pid()", (dbname,))
+        conn.execute(f'DROP DATABASE IF EXISTS {dbname}')
 
 class Client:
     def __init__(self,port): self.port=port;self.cookie='';self.csrf=''
@@ -38,31 +105,66 @@ class Client:
 class SystemTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        temp_root=server.ROOT/'.test-runs'
+        cls.pg_test = None
+        cls._old_env = {k: os.environ.get(k) for k in ('NEXUS_DATABASE_URL','NEXUS_DB_URL','NEXUS_DB')}
+        cls.old_db = server.DB_PATH
+        temp_root = server.ROOT / '.test-runs'
         temp_root.mkdir(exist_ok=True)
-        cls.test_dir=temp_root/('run-'+uuid.uuid4().hex)
+        cls.test_dir = temp_root / ('run-' + uuid.uuid4().hex)
         cls.test_dir.mkdir()
-        cls.old_db=server.DB_PATH;server.DB_PATH=cls.test_dir/'test.sqlite3';server.initialize()
+        if _is_pg_test():
+            base = PG_TEST_URL
+            test_url, dbname, admin_url = _create_pg_test_db(base)
+            cls.pg_test = (test_url, dbname, admin_url)
+            os.environ['NEXUS_DATABASE_URL'] = test_url
+            os.environ.pop('NEXUS_DB_URL', None)
+            server.DB_PATH = cls.test_dir / 'unused-postgres.sqlite3'
+            server.initialize()
+        else:
+            os.environ.pop('NEXUS_DATABASE_URL', None)
+            os.environ.pop('NEXUS_DB_URL', None)
+            server.DB_PATH = cls.test_dir / 'test.sqlite3'
+            server.initialize()
         class QuietHandler(server.Handler):
-            def log_message(self,*args): pass
-        cls.http=server.ThreadingHTTPServer(('127.0.0.1',0),QuietHandler)
-        cls.thread=threading.Thread(target=cls.http.serve_forever,daemon=True);cls.thread.start();cls.port=cls.http.server_port
-        cls.password='Integration-test-passphrase-42'
-        cls.admin=Client(cls.port);cls.admin.ok('/auth/register','POST',{'email':'owner@alpha.test','password':cls.password,'name':'Alpha Owner','organization':'Alpha Business','currency':'USD'})
-        cls.me=cls.admin.ok('/me');cls.org=cls.me['organization']['id'];cls.owner_id=cls.me['user']['user_id']
-        cls.actors={}
-        for role in ['manager','member','finance','viewer']:
-            inv=cls.admin.ok('/invitations','POST',{'email':role+'@alpha.test','role':role,'department':'Testing'})
-            c=Client(cls.port);c.ok('/auth/join','POST',{'token':inv['token'],'email':role+'@alpha.test','password':cls.password,'name':role.title()})
-            cls.actors[role]=(c,c.ok('/me')['user']['user_id'])
-        cls.other=Client(cls.port);cls.other.ok('/auth/register','POST',{'email':'owner@beta.test','password':cls.password,'name':'Beta Owner','organization':'Beta Business'})
+            def log_message(self, *args): pass
+        cls.http = server.ThreadingHTTPServer(('127.0.0.1', 0), QuietHandler)
+        cls.thread = threading.Thread(target=cls.http.serve_forever, daemon=True); cls.thread.start(); cls.port = cls.http.server_port
+        cls.password = 'Integration-test-passphrase-42'
+        cls.admin = Client(cls.port); cls.admin.ok('/auth/register', 'POST', {'email': 'owner@alpha.test', 'password': cls.password, 'name': 'Alpha Owner', 'organization': 'Alpha Business', 'currency': 'USD'})
+        cls.me = cls.admin.ok('/me'); cls.org = cls.me['organization']['id']; cls.owner_id = cls.me['user']['user_id']
+        cls.actors = {}
+        for role in ['manager', 'member', 'finance', 'viewer']:
+            inv = cls.admin.ok('/invitations', 'POST', {'email': role + '@alpha.test', 'role': role, 'department': 'Testing'})
+            c = Client(cls.port); c.ok('/auth/join', 'POST', {'token': inv['token'], 'email': role + '@alpha.test', 'password': cls.password, 'name': role.title()})
+            cls.actors[role] = (c, c.ok('/me')['user']['user_id'])
+        cls.other = Client(cls.port); cls.other.ok('/auth/register', 'POST', {'email': 'owner@beta.test', 'password': cls.password, 'name': 'Beta Owner', 'organization': 'Beta Business'})
     @classmethod
     def tearDownClass(cls):
-        cls.http.shutdown();cls.http.server_close();cls.thread.join(timeout=3)
-        server.DB_PATH=cls.old_db
-        for name in ('test.sqlite3','test.sqlite3-wal','test.sqlite3-shm'):
-            (cls.test_dir/name).unlink(missing_ok=True)
-        cls.test_dir.rmdir()
+        cls.http.shutdown(); cls.http.server_close(); cls.thread.join(timeout=3)
+        try:
+            server.DB_PATH = cls.old_db
+        except Exception:
+            pass
+        # restore env
+        for k, v in getattr(cls, '_old_env', {}).items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if getattr(cls, 'pg_test', None):
+            try:
+                _drop_pg_test_db(*cls.pg_test)
+            except Exception as e:
+                print('PG test DB cleanup failed:', e)
+        for name in ('test.sqlite3', 'test.sqlite3-wal', 'test.sqlite3-shm', 'unused-postgres.sqlite3'):
+            try:
+                (cls.test_dir / name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            cls.test_dir.rmdir()
+        except Exception:
+            pass
     def project(self,private=False,client=None):
         return (client or self.admin).ok('/projects','POST',{'name':'Project '+uuid.uuid4().hex[:8],'private':private,'budget':'1200.55'})
     def channel(self,project):
@@ -192,6 +294,28 @@ class SystemTests(unittest.TestCase):
             results=list(pool.map(lambda _:manager.call('/requisitions/'+r['id']+'/review','POST',{'decision':'approved'})[0],range(2)))
         self.assertEqual(sorted(results),[200,409])
 
+    def test_concurrent_payment_only_one_transition(self):
+        inv=self.invoice();iid=inv['id'];self.admin.ok('/invoices/'+iid+'/issue','POST')
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            results=list(pool.map(lambda _:self.admin.call('/invoices/'+iid+'/payment','POST')[0],range(2)))
+        self.assertEqual(sorted(results),[200,409])
+        with server.connect_db() as db:
+            entries=db.execute('SELECT e.id,SUM(l.debit) debit,SUM(l.credit) credit FROM ledger_entries e JOIN ledger_lines l ON l.entry_id=e.id WHERE e.invoice_id=? GROUP BY e.id',(iid,)).fetchall()
+            kinds=db.execute('SELECT kind FROM ledger_entries WHERE invoice_id=? ORDER BY kind',(iid,)).fetchall()
+        self.assertEqual([k['kind'] for k in kinds],['issue','payment'])
+        for e in entries:self.assertEqual(e['debit'],e['credit'])
+
+    def test_concurrent_po_issue_only_one_transition(self):
+        r=self.request();rid=r['id'];supplier=self.admin.ok('/suppliers','POST',{'name':'Concurrent supplier '+uuid.uuid4().hex[:6]})
+        self.admin.ok('/requisitions/'+rid+'/submit','POST')
+        manager,_=self.actors['manager'];manager.ok('/requisitions/'+rid+'/review','POST',{'decision':'approved','comment':'ok'})
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            results=list(pool.map(lambda _:self.admin.call('/requisitions/'+rid+'/order','POST',{'supplier_id':supplier['id']})[0],range(2)))
+        self.assertEqual(sorted(results),[200,409])
+        with server.connect_db() as db:
+            pos=db.execute('SELECT id FROM purchase_orders WHERE requisition_id=?',(rid,)).fetchall()
+        self.assertEqual(len(pos),1)
+
     def test_finance_double_entry_payment_and_duplicate_protection(self):
         inv=self.invoice();iid=inv['id']
         self.admin.ok('/invoices/'+iid+'/issue','POST')
@@ -247,9 +371,9 @@ class SystemTests(unittest.TestCase):
     def test_audit_and_ledger_are_append_only(self):
         inv=self.invoice();self.admin.ok('/invoices/'+inv['id']+'/issue','POST')
         with server.connect_db() as db:
-            with self.assertRaises(sqlite3.IntegrityError):db.execute('UPDATE ledger_lines SET debit=1')
-            with self.assertRaises(sqlite3.IntegrityError):db.execute('DELETE FROM ledger_entries')
-            with self.assertRaises(sqlite3.IntegrityError):db.execute("UPDATE audit_log SET action='hidden'")
+            with self.assertRaises(DB_ERRORS):db.execute('UPDATE ledger_lines SET debit=1')
+            with self.assertRaises(DB_ERRORS):db.execute('DELETE FROM ledger_entries')
+            with self.assertRaises(DB_ERRORS):db.execute("UPDATE audit_log SET action='hidden'")
         rows=self.admin.ok('/audit');self.assertTrue(any(a['action']=='issue' and a['record_id']==inv['id'] for a in rows))
 
     def test_last_admin_and_existing_session_role_change(self):
@@ -258,6 +382,29 @@ class SystemTests(unittest.TestCase):
         c=Client(self.port);c.ok('/auth/join','POST',{'email':email,'name':'Role Change','password':self.password,'token':inv['token']});user_id=c.ok('/me')['user']['user_id']
         self.admin.ok('/people/'+user_id,'PATCH',{'role':'viewer'})
         self.assertEqual(c.call('/projects','POST',{'name':'Blocked after demotion'})[0],403)
+
+    def test_membership_deactivation_reactivation_and_session_revocation(self):
+        email='deact-'+uuid.uuid4().hex[:8]+'@alpha.test';inv=self.admin.ok('/invitations','POST',{'email':email,'role':'member','department':'Ops'})
+        c=Client(self.port);c.ok('/auth/join','POST',{'email':email,'name':'Deact User','password':self.password,'token':inv['token']});user_id=c.ok('/me')['user']['user_id']
+        people=self.admin.ok('/people');p=next(x for x in people if x['id']==user_id)
+        self.assertTrue(p['active']);self.assertEqual(p['department'],'Ops')
+        self.admin.ok('/people/'+user_id,'PATCH',{'role':'member','department':'Ops','active':False})
+        self.assertEqual(c.call('/me')[0],401)
+        self.assertEqual(Client(self.port).call('/auth/login','POST',{'email':email,'password':self.password})[0],403)
+        people=self.admin.ok('/people');p=next(x for x in people if x['id']==user_id);self.assertFalse(p['active'])
+        self.admin.ok('/people/'+user_id,'PATCH',{'role':'member','department':'Ops','active':True})
+        c2=Client(self.port);c2.ok('/auth/login','POST',{'email':email,'password':self.password});self.assertEqual(c2.ok('/me')['user']['email'],email)
+        audit=self.admin.ok('/audit')
+        self.assertTrue(any(a['action']=='deactivate_member' and a['record_id']==user_id for a in audit))
+        self.assertTrue(any(a['action']=='reactivate_member' and a['record_id']==user_id for a in audit))
+
+    def test_last_active_admin_cannot_be_deactivated(self):
+        self.assertEqual(self.admin.call('/people/'+self.owner_id,'PATCH',{'role':'admin','department':'','active':False})[0],400)
+        email='admin2-'+uuid.uuid4().hex[:8]+'@alpha.test';inv=self.admin.ok('/invitations','POST',{'email':email,'role':'admin'})
+        c=Client(self.port);c.ok('/auth/join','POST',{'email':email,'name':'Admin Two','password':self.password,'token':inv['token']});user_id=c.ok('/me')['user']['user_id']
+        self.admin.ok('/people/'+user_id,'PATCH',{'role':'admin','department':'','active':False})
+        self.assertEqual(c.call('/me')[0],401)
+        self.admin.ok('/people/'+user_id,'PATCH',{'role':'member','department':'','active':False})
 
     def test_login_logout_and_invalid_credentials(self):
         c=Client(self.port);self.assertEqual(c.call('/auth/login','POST',{'email':'owner@alpha.test','password':'wrong'})[0],401)
@@ -375,7 +522,7 @@ class SystemTests(unittest.TestCase):
         d=self.admin.ok('/documents/'+result['id']);self.assertEqual(len(d['versions']),2);self.assertEqual(d['versions'][0]['version_note'],'Updated policy')
         self.assertEqual(self.admin.ok('/document-files/'+result['file_id']),pdf)
         with server.connect_db() as db:
-            with self.assertRaises(sqlite3.IntegrityError):db.execute('UPDATE document_files SET version_note=? WHERE id=?',('Tamper',result['file_id']))
+            with self.assertRaises(DB_ERRORS):db.execute('UPDATE document_files SET version_note=? WHERE id=?',('Tamper',result['file_id']))
 
     def test_document_file_private_access_and_revocation(self):
         p=self.project(True);member,member_id=self.actors['member'];d=self.upload(project_id=p['id'])
@@ -459,6 +606,71 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(Client(self.port).call('/exports/tasks.csv')[0],401)
 
 
+    def test_idempotency_replay_conflict_and_scope(self):
+        key='idem-'+uuid.uuid4().hex
+        h={'Idempotency-Key':key}
+        p={'name':'Idem Project','budget':'100.00','due_date':'2026-12-31','description':'x','private':False}
+        s1,r1=self.admin.call('/projects','POST',p,h); self.assertEqual(s1,200)
+        s2,r2=self.admin.call('/projects','POST',p,h); self.assertEqual(s2,200); self.assertEqual(r1['id'],r2['id'])
+        self.assertEqual(len([x for x in self.admin.ok('/projects') if x['name']=='Idem Project']),1)
+        # same key, different endpoint -> conflict
+        s3,_=self.admin.call('/customers','POST',{'name':'X'},h); self.assertEqual(s3,409)
+        # same key, same endpoint, different payload -> conflict
+        p2=dict(p); p2['name']='Idem Project 2'
+        s4,_=self.admin.call('/projects','POST',p2,h); self.assertEqual(s4,409)
+        # scoped by org+user: other user same key can create independently
+        manager,_=self.actors['manager']
+        s5,r5=manager.call('/projects','POST',{'name':'Mgr Idem','budget':'1.00','due_date':'2026-12-31','description':'','private':False},h)
+        self.assertEqual(s5,200); self.assertNotEqual(r1['id'],r5['id'])
+
+    def test_idempotency_critical_flows(self):
+        # customer/supplier/product
+        ck='idem-c-'+uuid.uuid4().hex
+        s,r=self.admin.call('/customers','POST',{'name':'Idem Cust'},{'Idempotency-Key':ck}); self.assertEqual(s,200)
+        s2,r2=self.admin.call('/customers','POST',{'name':'Idem Cust'},{'Idempotency-Key':ck}); self.assertEqual(r['id'],r2['id'])
+        sk='idem-s-'+uuid.uuid4().hex
+        s,r=self.admin.call('/suppliers','POST',{'name':'Idem Sup','email':'s@example.com','notes':''},{'Idempotency-Key':sk}); self.assertEqual(s,200)
+        self.assertEqual(r['id'],self.admin.call('/suppliers','POST',{'name':'Idem Sup','email':'s@example.com','notes':''},{'Idempotency-Key':sk})[1]['id'])
+        pk='idem-p-'+uuid.uuid4().hex
+        prod={'name':'Idem Prod','sku':'IDEM-'+uuid.uuid4().hex[:8],'unit':'each','unit_price':'10.00'}
+        s,r=self.admin.call('/products','POST',prod,{'Idempotency-Key':pk}); self.assertEqual(s,200)
+        self.assertEqual(r['id'],self.admin.call('/products','POST',prod,{'Idempotency-Key':pk})[1]['id'])
+        # requisition create/submit/review/order
+        rk='idem-r-'+uuid.uuid4().hex
+        req_body={'item':'Idem Item','quantity':1,'unit_price':'5.00','project_id':'','notes':'n','source_message_id':None}
+        s,req=self.admin.call('/requisitions','POST',req_body,{'Idempotency-Key':rk}); self.assertEqual(s,200)
+        self.assertEqual(req['id'],self.admin.call('/requisitions','POST',req_body,{'Idempotency-Key':rk})[1]['id'])
+        subk='idem-sub-'+uuid.uuid4().hex
+        s,sub=self.admin.call('/requisitions/'+req['id']+'/submit','POST',{}, {'Idempotency-Key':subk}); self.assertEqual(s,200)
+        s2,sub2=self.admin.call('/requisitions/'+req['id']+'/submit','POST',{}, {'Idempotency-Key':subk}); self.assertEqual(s2,200); self.assertEqual(sub['status'],sub2['status'])
+        manager,_=self.actors['manager']
+        revk='idem-rev-'+uuid.uuid4().hex
+        s,rev=manager.call('/requisitions/'+req['id']+'/review','POST',{'decision':'approved','comment':'ok'},{'Idempotency-Key':revk}); self.assertEqual(s,200)
+        s2,rev2=manager.call('/requisitions/'+req['id']+'/review','POST',{'decision':'approved','comment':'ok'},{'Idempotency-Key':revk}); self.assertEqual(s2,200); self.assertEqual(rev['status'],rev2['status'])
+        # create supplier for order
+        s,sup=self.admin.call('/suppliers','POST',{'name':'Order Sup','email':'','notes':''},{'Idempotency-Key':'idem-os-'+uuid.uuid4().hex})
+        ork='idem-ord-'+uuid.uuid4().hex
+        s,ordr=manager.call('/requisitions/'+req['id']+'/order','POST',{'supplier_id':sup['id']},{'Idempotency-Key':ork}); self.assertEqual(s,200)
+        s2,ordr2=manager.call('/requisitions/'+req['id']+'/order','POST',{'supplier_id':sup['id']},{'Idempotency-Key':ork}); self.assertEqual(s2,200); self.assertEqual(ordr['id'],ordr2['id'])
+        # invoice issue/payment/void
+        cust_id=self.admin.ok('/customers','POST',{'name':'Inv Cust '+uuid.uuid4().hex[:4]})['id']
+        ik='idem-inv-'+uuid.uuid4().hex
+        inv_body={'number':'INV-IDEM-'+uuid.uuid4().hex[:6],'customer_id':cust_id,'total':'10.00','due_date':'2026-12-31','description':'d'}
+        s,inv=self.admin.call('/invoices','POST',inv_body,{'Idempotency-Key':ik}); self.assertEqual(s,200)
+        self.assertEqual(inv['id'],self.admin.call('/invoices','POST',inv_body,{'Idempotency-Key':ik})[1]['id'])
+        issuek='idem-issue-'+uuid.uuid4().hex
+        s,i1=self.admin.call('/invoices/'+inv['id']+'/issue','POST',{},{'Idempotency-Key':issuek}); self.assertEqual(s,200)
+        s2,i2=self.admin.call('/invoices/'+inv['id']+'/issue','POST',{},{'Idempotency-Key':issuek}); self.assertEqual(s2,200); self.assertEqual(i1['status'],i2['status'])
+        payk='idem-pay-'+uuid.uuid4().hex
+        s,p1=self.admin.call('/invoices/'+inv['id']+'/payment','POST',{},{'Idempotency-Key':payk}); self.assertEqual(s,200)
+        s2,p2=self.admin.call('/invoices/'+inv['id']+'/payment','POST',{},{'Idempotency-Key':payk}); self.assertEqual(s2,200); self.assertEqual(p1['status'],p2['status'])
+        inv2_body={'number':'INV-VOID-'+uuid.uuid4().hex[:6],'customer_id':cust_id,'total':'5.00','due_date':'2026-12-31','description':'v'}
+        inv2=self.admin.ok('/invoices','POST',inv2_body)
+        self.admin.ok('/invoices/'+inv2['id']+'/issue','POST',{})
+        vk='idem-void-'+uuid.uuid4().hex
+        s,v1=self.admin.call('/invoices/'+inv2['id']+'/void','POST',{},{'Idempotency-Key':vk}); self.assertEqual(s,200)
+        s2,v2=self.admin.call('/invoices/'+inv2['id']+'/void','POST',{},{'Idempotency-Key':vk}); self.assertEqual(s2,200); self.assertEqual(v1['status'],v2['status'])
+
     def workflow(self,source='low_stock',action='task',schedule='manual'):
         return self.admin.ok('/workflows','POST',{'name':'Workflow '+uuid.uuid4().hex[:6],'definition':{'source':source,'action':action,'threshold':0,'days':30,'schedule':schedule}})
 
@@ -477,7 +689,7 @@ class SystemTests(unittest.TestCase):
         self.admin.ok(base+'/versions','POST',{'definition':definition});self.admin.ok(base+'/activate','POST',{'version':2});self.admin.ok(base+'/activate','POST',{'version':1})
         self.assertEqual(self.admin.ok(base)['active_version'],1)
         with server.connect_db() as db:
-            with self.assertRaises(sqlite3.IntegrityError):db.execute("UPDATE workflow_versions SET definition='{}' WHERE rule_id=?",(rule['id'],))
+            with self.assertRaises(DB_ERRORS):db.execute("UPDATE workflow_versions SET definition='{}' WHERE rule_id=?",(rule['id'],))
 
     def test_workflow_tenant_role_and_validation(self):
         rule=self.workflow();base='/workflows/'+rule['id']
