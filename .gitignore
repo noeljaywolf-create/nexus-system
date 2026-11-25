@@ -1,6 +1,35 @@
+# Runtime / local data
 data/
 backups/
 .test-runs/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments / secrets
 .env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Node / build artifacts
+node_modules/
+dist/
+coverage/
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
