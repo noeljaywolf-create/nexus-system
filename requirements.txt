@@ -1,0 +1,2 @@
+# SQLite mode uses only the Python standard library.
+# Install the optional PostgreSQL driver with: pip install "psycopg[binary]"

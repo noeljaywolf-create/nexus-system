@@ -1,0 +1,16 @@
+# Disposable testing only: the free service filesystem is ephemeral.
+services:
+  - type: web
+    name: nexus-system
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u render_start.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: NEXUS_SECURE_COOKIE
+        value: "1"
+      - key: NEXUS_DISABLE_DEMO
+        value: "1"

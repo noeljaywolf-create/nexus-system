@@ -82,6 +82,9 @@ Postgres settings: `NEXUS_DATABASE_URL` / `NEXUS_DB_URL`, `NEXUS_PG_CONNECT_TIME
 
 ## Engineering & Security Design
 
+For a disposable hosted test, see [Render free-plan setup](docs/RENDER.md).
+Free-service SQLite storage is ephemeral: use synthetic data only.
+
 ### Tenant Isolation & RBAC
 - Every authenticated request resolves identity from session + active membership in the same org.
 - Service layer binds `org_id`, `user_id`, `role`; queries are org-scoped.
