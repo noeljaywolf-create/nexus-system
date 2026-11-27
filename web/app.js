@@ -385,4 +385,49 @@ document.addEventListener('keydown',e=>{
 $('#modal').addEventListener('cancel',e=>{if(state.uploading)e.preventDefault();});
 $('#modal').addEventListener('click',e=>{if(e.target===$('#modal')){const r=e.target.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)closeModal();}});
 async function boot(){const invite=location.hash.match(/^#invite=(.+)$/);if(invite){history.replaceState(null,'',location.pathname);showAuth('join',decodeURIComponent(invite[1]));return;}try{await enter();}catch(e){showAuth('login');if(!e.message.includes('Sign in'))toast(e.message);}}
+// Mobile sections use the same navigation tree as desktop, not a second menu.
+function setupSectionDrawer(){
+  const shell=document.querySelector('#shell'),aside=shell.querySelector('aside'),main=shell.querySelector('main');
+  const media=window.matchMedia('(max-width: 800px)');
+  aside.id='sectionDrawer';
+  const toggle=document.createElement('button');
+  toggle.type='button';toggle.className='section-menu-toggle';toggle.setAttribute('aria-controls',aside.id);
+  toggle.setAttribute('aria-expanded','false');toggle.setAttribute('aria-label','Open sections navigation');
+  toggle.innerHTML='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span>Sections</span>';
+  main.querySelector('header').prepend(toggle);
+  const close=document.createElement('button');close.type='button';close.className='section-drawer-close';
+  close.textContent='Close sections';close.setAttribute('aria-label','Close sections navigation');aside.prepend(close);
+  const backdrop=document.createElement('button');backdrop.type='button';backdrop.className='section-drawer-backdrop';
+  backdrop.setAttribute('aria-label','Close sections navigation');backdrop.tabIndex=-1;backdrop.hidden=true;shell.append(backdrop);
+  let open=false;
+  function setOpen(value,restore=true){
+    open=Boolean(value&&media.matches&&!shell.hidden);
+    shell.classList.toggle('sections-open',open);document.body.classList.toggle('sections-scroll-locked',open);
+    toggle.setAttribute('aria-expanded',String(open));backdrop.hidden=!open;
+    aside.inert=media.matches&&!open;main.inert=open;
+    if(open){aside.setAttribute('role','dialog');aside.setAttribute('aria-modal','true');aside.setAttribute('aria-label','Workspace sections');close.focus();}
+    else{aside.removeAttribute('role');aside.removeAttribute('aria-modal');aside.removeAttribute('aria-label');if(restore&&media.matches&&!shell.hidden)toggle.focus();}
+  }
+  toggle.addEventListener('click',()=>setOpen(!open));close.addEventListener('click',()=>setOpen(false));backdrop.addEventListener('click',()=>setOpen(false));
+  aside.addEventListener('click',e=>{
+    if(!open||!e.target.closest('[data-action]'))return;
+    setOpen(false,false);
+    // Move focus out of the now-inert drawer without stealing focus from dialogs.
+    toggle.focus();
+  },true);
+  document.addEventListener('keydown',e=>{
+    if(!open)return;
+    if(e.key==='Escape'){e.preventDefault();e.stopImmediatePropagation();setOpen(false);return;}
+    if(e.key==='Tab'){
+      const items=[...aside.querySelectorAll('button:not(:disabled),a[href],input,select,[tabindex="0"]')].filter(el=>el.getClientRects().length);
+      const first=items[0],last=items[items.length-1];
+      if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+      else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+    }
+  },true);
+  media.addEventListener('change',()=>setOpen(false,false));
+  new MutationObserver(()=>{if(shell.hidden)setOpen(false,false);}).observe(shell,{attributes:true,attributeFilter:['hidden']});
+  setOpen(false,false);
+}
+setupSectionDrawer();
 boot();

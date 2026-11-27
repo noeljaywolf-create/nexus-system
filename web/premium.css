@@ -19,4 +19,37 @@ body{font-size:14px}nav button{font-size:12px}.navlabel{font-size:9px;letter-spa
 @media(max-width:600px){nav button{font-size:11px}.subtitle{font-size:11px}.eyebrow{font-size:8px}.titlebar h1{font-size:25px}.metric-label{font-size:10px}.metric-foot{font-size:9px}.metric strong{font-size:26px}.overview-signal strong{font-size:11px}.overview-signal p{font-size:10px}.overview-signal>.btn{font-size:10px}.cardhead h2{font-size:12px}.attention-row .grow>b{font-size:11px}.attention-row .grow>small{font-size:9px}.agenda-task .grow>b{font-size:11px}.agenda-task .grow>small{font-size:9px}.document-card h3{font-size:11px}.document-card p{font-size:9px}.document-card-bottom{font-size:8px}.document-format{font-size:8px}.document-tags span{font-size:8px}.folder-button{font-size:10px}.document-summary{font-size:10px}.document-summary>span:last-child{font-size:9px}.workspace-notice{font-size:10px}.auth-tabs button{font-size:10px}.auth-card>.hint{font-size:11px}.auth-card input,.auth-card select{font-size:12px}.demo-entry{font-size:11px}.chathead b{font-size:12px}.message p{font-size:12px}.message small{font-size:8px}.document-inspector p{font-size:11px}.footer{font-size:9px}}
 header{position:sticky;top:0;z-index:12}.global-search input{font-size:11px!important}.chart-period{font-family:inherit;background:#fff;color:#8490a7;cursor:pointer}.document-inspector .inspector-label{color:#9b88af}.auth-hero-content>p{color:#a4afc9}.document-preview-frame{background:#edf0f5}
 
+/* Full-label mobile navigation; desktop keeps its existing sidebar. */
+.section-menu-toggle,.section-drawer-close,.section-drawer-backdrop{display:none}
+@media(max-width:800px){
+  #shell>aside{position:fixed;inset:0 auto 0 0;z-index:51;width:min(320px,88vw);height:100dvh;padding:16px 14px max(16px,env(safe-area-inset-bottom));display:flex;flex-direction:column;transform:translateX(-100%);visibility:hidden;transition:transform .2s ease,visibility .2s;overflow:hidden;box-shadow:12px 0 40px #0f172a30}
+  #shell.sections-open>aside{transform:translateX(0);visibility:visible}
+  #shell>main{margin-left:0;min-width:0;width:100%}
+  #shell>aside .brand .word,#shell>aside .navlabel,#shell>aside .navtext{display:block!important}
+  #shell>aside .org{display:flex!important;margin-bottom:10px}
+  #shell>aside .brand{padding:12px 10px 18px}
+  #shell>aside nav{min-height:0;overflow-y:auto;overscroll-behavior:contain;flex:1}
+  #shell>aside nav button{justify-content:flex-start;padding:10px 12px!important;min-height:46px;font-size:14px;gap:12px;text-align:left}
+  #shell>aside .navlabel{font-size:10px;margin:18px 12px 8px}
+  #shell>aside .bottom>button:not(.profile){justify-content:flex-start;min-height:44px}
+  #shell>aside .bottom>button:not(.profile)>span:not(.bottom-icon),#shell>aside .profile>span:not(.avatar){display:block!important}
+  #shell>aside .bottom .profile{justify-content:flex-start;gap:12px}
+  .section-menu-toggle{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:8px 10px;flex-shrink:0;border:1px solid #dce0eb;border-radius:8px;color:#28334b;background:#fff;font-size:13px;font-weight:600;cursor:pointer}
+  .section-drawer-close{display:block;align-self:flex-end;min-height:44px;padding:8px 12px;color:#fff;border:1px solid #ffffff30;border-radius:8px;cursor:pointer}
+  .section-drawer-backdrop:not([hidden]){display:block;position:fixed;inset:0;z-index:50;background:#0f172a80;border:0;cursor:pointer}
+  body.sections-scroll-locked{overflow:hidden}
+  #shell header{justify-content:space-between;gap:10px;padding:0 12px}
+  #shell header .search{min-width:0;flex:1;justify-content:flex-end}
+  #shell header .global-search{min-width:0;flex:1;max-width:280px}
+  #shell header .global-search input{width:100%!important;min-width:0}
+  #shell header .global-search kbd{display:none}
+  .section-menu-toggle:focus-visible,.section-drawer-close:focus-visible{outline:3px solid #a99aff;outline-offset:3px}
+}
+@media(max-width:450px){
+  #shell header .global-search{display:none}
+  #shell header .search>.avatar{display:flex}
+  #shell header .global-create,#shell header .search>.icon-button{min-width:44px;min-height:44px}
+  #shell .workspace{padding:20px 14px}
+}
+
 .workflow-flow{display:grid;gap:8px;margin:20px 0}.workflow-flow>div{display:grid;gap:6px;padding:15px;border:1px solid #e5e8ef;border-radius:10px;background:#f8fafc}.workflow-flow small{font-size:10px;letter-spacing:.12em;color:#69758c}.workflow-flow>span{text-align:center;color:#8b7cf6}
