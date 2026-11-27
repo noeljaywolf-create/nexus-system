@@ -21,6 +21,7 @@ header{position:sticky;top:0;z-index:12}.global-search input{font-size:11px!impo
 
 /* Full-label mobile navigation; desktop keeps its existing sidebar. */
 .section-menu-toggle,.section-drawer-close,.section-drawer-backdrop{display:none}
+.audit-detail-list{margin:0;max-width:360px;overflow-wrap:anywhere}.audit-detail-list>div{display:flex;gap:8px;margin:4px 0;align-items:baseline}.audit-detail-list dt{font-weight:600;flex-shrink:0}.audit-detail-list dt::after{content:':'}.audit-detail-list dd{margin:0;min-width:0}.audit-trace{margin-top:8px;font-size:11px;max-width:360px;overflow-wrap:anywhere}.audit-trace summary{cursor:pointer;color:#58677f;padding:4px 0}.audit-trace>span{display:block;margin-top:6px}.audit-trace summary:focus-visible{outline:3px solid #a99aff;outline-offset:2px}
 @media(max-width:800px){
   #shell>aside{position:fixed;inset:0 auto 0 0;z-index:51;width:min(320px,88vw);height:100dvh;padding:16px 14px max(16px,env(safe-area-inset-bottom));display:flex;flex-direction:column;transform:translateX(-100%);visibility:hidden;transition:transform .2s ease,visibility .2s;overflow:hidden;box-shadow:12px 0 40px #0f172a30}
   #shell.sections-open>aside{transform:translateX(0);visibility:visible}
