@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import workflows
 import ai_gateway
+import local_agent
 from document_store import DocumentStore,PREVIEWABLE
 from exports import make_csv
 
@@ -1023,7 +1024,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header('Content-Length',str(len(f['content'])));self.end_headers();self.wfile.write(f['content']);return
                 if path=='/api/assistant' and self.command=='POST':
                     data=self.body();conversation_id=text(data,'conversation_id',limit=32);service.conversation(conversation_id)
-                    action=enum(data,'action',{'summary','actions','reply','translate'},'summary')
+                    action=enum(data,'action',{'summary','actions','reply','translate','search','help'},'summary')
+                    mode=enum(data,'mode',{'offline','local','external'},'offline')
+                    provider=ai_gateway.status()['modes'][mode]
+                    require(mode=='offline' or provider['configured'],'This model mode is not configured; select Offline or ask an administrator to configure it.',400)
+                    require(mode!='offline' or action!='translate','Offline mode cannot translate; choose a configured local model or external provider.',400)
+                    query=text(data,'query',False,200)
+                    require(action!='search' or bool(query.strip()),'Enter a search query',400)
                     cutoff=(datetime.now(timezone.utc)-timedelta(minutes=1)).isoformat(timespec='microseconds')
                     count=db.execute("SELECT COUNT(*) FROM audit_log WHERE org_id=? AND actor_id=? AND record_type='ai_assistance' AND created_at>?",(identity['org_id'],identity['user_id'],cutoff)).fetchone()[0]
                     require(count<10,'AI assistance is limited to 10 requests per minute',429)
@@ -1032,14 +1039,17 @@ class Handler(BaseHTTPRequestHandler):
                     rows=service.get('/api/conversations/'+conversation_id+'/messages',{})
                     context=[{k:r[k] for k in ('id','author_name','body')} for r in rows if not r['deleted_at']][-100:]
                     require(context,'The conversation has no messages to process')
-                    service.audit('request_'+action,'ai_assistance',conversation_id,{'provider':ai_gateway.status()['destination']})
+                    service.audit('request_'+action,'ai_assistance',conversation_id,{'provider':provider['destination'],'mode':mode})
                     # Release the DB lock while the configured provider processes the request.
                     db.commit()
-                    try: result=ai_gateway.generate(context,prompts[action])
+                    try:
+                        if mode=='offline' or action in ('help','search'):
+                            result=local_agent.respond(context,action,query)
+                        else:result=ai_gateway.generate(context,prompts[action],mode=mode)
                     except ai_gateway.ProviderError as exc: raise APIError(503,str(exc))
                     # Authorization may have changed while the provider was running.
                     refreshed=self.identity(db);Service(db,refreshed).conversation(conversation_id);db.commit()
-                    return self.reply({'text':result,'source_message_ids':[r['id'] for r in context],'provider':ai_gateway.status()['destination'],'generated':True})
+                    return self.reply({'text':result,'source_message_ids':[r['id'] for r in context],'provider':provider['destination'] if action not in ('help','search') else 'Nexus server (no model or network)','mode':mode,'generated':mode!='offline' and action not in ('help','search')})
                 if path=='/api/auth/switch' and self.command=='POST':
                     org_id=text(self.body(),'org_id',limit=32)
                     require(db.execute('SELECT 1 FROM memberships WHERE org_id=? AND user_id=? AND active=1',(org_id,identity['user_id'])).fetchone(),'You do not belong to this workspace',403)

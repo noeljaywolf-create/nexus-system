@@ -82,6 +82,14 @@ Postgres settings: `NEXUS_DATABASE_URL` / `NEXUS_DB_URL`, `NEXUS_PG_CONNECT_TIME
 
 ## Engineering & Security Design
 
+### Offline-first assistant
+
+Nexus includes deterministic conversation digests, action candidates, draft reply
+templates, recent-message search and workflow guidance with **no LLM required**.
+Optional Ollama/local models and external providers are explicitly selected, never
+automatic fallbacks. All modes retain company/conversation access checks and have
+no business-action execution tools. See [Assistant setup and boundaries](docs/ASSISTANT.md).
+
 For a disposable hosted test, see [Render free-plan setup](docs/RENDER.md).
 Free-service SQLite storage is ephemeral: use synthetic data only.
 
